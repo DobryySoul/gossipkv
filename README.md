@@ -105,7 +105,7 @@ All parameters are configured via `Option` in `New(...)`. Below is the behavior 
 1.  **Установка**
 
     ```bash
-    go get github.com/DobryySoul/gossip-kv/gossipkv
+    go get github.com/DobryySoul/gossipkv
     ```
 
 ### Manual peer setup (no discovery)
