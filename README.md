@@ -62,6 +62,7 @@ All parameters are configured via `Option` in `New(...)`. Below is the behavior 
 
 **`WithDiscovery(bool)`**
 - Enables mDNS discovery on the local network.
+- Defaults to `false`.
 - Requires `WithBindAddr` so the node can announce itself.
 
 **`WithCodec(codec)`**
@@ -108,21 +109,6 @@ All parameters are configured via `Option` in `New(...)`. Below is the behavior 
     go get github.com/DobryySoul/gossipkv
     ```
 
-### Manual peer setup (no discovery)
-
-To exchange data between nodes, provide a bind address and a list of peers.
-
-```go
-db, err := gossipkv.New[string, string](
-    gossipkv.WithNodeID("node-a"),
-    gossipkv.WithBindAddr("127.0.0.1:9001"),
-    gossipkv.WithSeeds([]string{
-        "127.0.0.1:9002",
-        "127.0.0.1:9003",
-    }),
-)
-```
-
 2.  **Использование**
 
     Initialize the database and start using it.
@@ -133,7 +119,7 @@ db, err := gossipkv.New[string, string](
     import (
         "context"
         "fmt"
-        "github.com/DobryySoul/gossip-kv/gossipkv"
+        "github.com/DobryySoul/gossipkv"
     )
 
     func main() {
@@ -154,7 +140,22 @@ db, err := gossipkv.New[string, string](
         if err != nil {
             // handle error
         }
-        
+
         fmt.Println("value:", value)
     }
     ```
+
+### Manual peer setup (no discovery)
+
+To exchange data between nodes, provide a bind address and a list of peers.
+
+```go
+db, err := gossipkv.New[string, string](
+    gossipkv.WithNodeID("node-a"),
+    gossipkv.WithBindAddr("127.0.0.1:9001"),
+    gossipkv.WithSeeds([]string{
+        "127.0.0.1:9002",
+        "127.0.0.1:9003",
+    }),
+)
+```
