@@ -5,7 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/DobryySoul/gossipkv"
@@ -45,5 +48,9 @@ func main() {
 
 	fmt.Printf("node %s running on %s\n", *nodeID, *bindAddr)
 	fmt.Println("press Ctrl+C to exit")
-	select {}
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	fmt.Println("\nshutting down...")
 }

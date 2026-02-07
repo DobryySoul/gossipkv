@@ -26,7 +26,7 @@ type Config struct {
 
 func defaultConfig() Config {
 	return Config{
-		Discovery:      true,
+		Discovery:      false,
 		GossipInterval: 2 * time.Second,
 	}
 }

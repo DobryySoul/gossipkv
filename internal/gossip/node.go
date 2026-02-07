@@ -13,6 +13,10 @@ import (
 	"github.com/DobryySoul/gossipkv/internal/storage"
 )
 
+// maxUDPPayload is a safe upper bound for a single UDP datagram.
+// Messages exceeding this size are automatically chunked.
+const maxUDPPayload = 65000
+
 type Node[K ~string, V any] struct {
 	id        string
 	bindAddr  string
@@ -22,9 +26,10 @@ type Node[K ~string, V any] struct {
 	unmarshal func([]byte) (V, error)
 	onError   func(error)
 
-	conn *net.UDPConn
-	stop chan struct{}
-	wg   sync.WaitGroup
+	conn     *net.UDPConn
+	stop     chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 
 	peersMu  sync.RWMutex
 	peers    []string
@@ -82,14 +87,17 @@ func (n *Node[K, V]) Start() error {
 	return nil
 }
 
+// Stop gracefully shuts down the gossip node. It is safe to call multiple times.
 func (n *Node[K, V]) Stop() error {
-	close(n.stop)
-	if n.conn != nil {
-		_ = n.conn.Close()
-	}
-	if n.cancel != nil {
-		n.cancel()
-	}
+	n.stopOnce.Do(func() {
+		close(n.stop)
+		if n.conn != nil {
+			_ = n.conn.Close()
+		}
+		if n.cancel != nil {
+			n.cancel()
+		}
+	})
 	n.wg.Wait()
 	return nil
 }
@@ -123,6 +131,8 @@ func (n *Node[K, V]) readLoop() {
 			n.handleDigest(addr, msg.Digest)
 		case msgDelta:
 			n.handleDelta(msg.Records)
+		case msgNeed:
+			n.handleNeed(addr, msg.Need)
 		}
 	}
 }
@@ -169,6 +179,9 @@ func (n *Node[K, V]) sendDigest() {
 	})
 }
 
+// handleDigest implements push-pull anti-entropy.
+// Phase 1: send records that the remote node is missing or has stale versions of.
+// Phase 2: request records the remote has that we are missing or have stale versions of.
 func (n *Node[K, V]) handleDigest(addr *net.UDPAddr, digest []DigestItem) {
 	remote := make(map[string]storage.Record[V], len(digest))
 	for _, item := range digest {
@@ -183,8 +196,12 @@ func (n *Node[K, V]) handleDigest(addr *net.UDPAddr, digest []DigestItem) {
 	if err != nil {
 		return
 	}
+
+	// Phase 1: collect records we have that the remote needs.
 	delta := make([]Record, 0, size)
+	localKeys := make(map[string]storage.Record[V], size)
 	if err := n.store.Range(n.ctx, func(key K, record storage.Record[V]) bool {
+		localKeys[string(key)] = record
 		other, ok := remote[string(key)]
 		if !ok || record.NewerThan(other) {
 			value, err := n.marshal(record.Value)
@@ -205,13 +222,36 @@ func (n *Node[K, V]) handleDigest(addr *net.UDPAddr, digest []DigestItem) {
 		return
 	}
 
-	if len(delta) == 0 {
-		return
+	if len(delta) > 0 {
+		n.sendMessage(addr.String(), Message{
+			Kind:    msgDelta,
+			Records: delta,
+		})
 	}
-	n.sendMessage(addr.String(), Message{
-		Kind:    msgDelta,
-		Records: delta,
-	})
+
+	// Phase 2: request records the remote has that we need.
+	var need []string
+	for _, item := range digest {
+		local, ok := localKeys[item.Key]
+		if !ok {
+			need = append(need, item.Key)
+			continue
+		}
+		remoteRecord := storage.Record[V]{
+			Version:   item.Version,
+			NodeID:    item.NodeID,
+			UpdatedAt: item.UpdatedAt,
+		}
+		if remoteRecord.NewerThan(local) {
+			need = append(need, item.Key)
+		}
+	}
+	if len(need) > 0 {
+		n.sendMessage(addr.String(), Message{
+			Kind: msgNeed,
+			Need: need,
+		})
+	}
 }
 
 func (n *Node[K, V]) handleDelta(records []Record) {
@@ -231,10 +271,58 @@ func (n *Node[K, V]) handleDelta(records []Record) {
 	}
 }
 
+// handleNeed responds with records that the remote node has requested.
+func (n *Node[K, V]) handleNeed(addr *net.UDPAddr, keys []string) {
+	delta := make([]Record, 0, len(keys))
+	for _, key := range keys {
+		record, err := n.store.Get(n.ctx, K(key))
+		if err != nil {
+			continue
+		}
+		value, err := n.marshal(record.Value)
+		if err != nil {
+			n.reportErr(fmt.Errorf("gossip: marshal: %w", err))
+			continue
+		}
+		delta = append(delta, Record{
+			Key:       key,
+			Value:     value,
+			Version:   record.Version,
+			NodeID:    record.NodeID,
+			UpdatedAt: record.UpdatedAt,
+		})
+	}
+	if len(delta) > 0 {
+		n.sendMessage(addr.String(), Message{
+			Kind:    msgDelta,
+			Records: delta,
+		})
+	}
+}
+
+// sendMessage encodes and sends a message via UDP. Messages that exceed
+// maxUDPPayload are automatically split into smaller chunks for delta and
+// need messages. Oversized digest messages are reported as errors.
 func (n *Node[K, V]) sendMessage(addr string, msg Message) {
 	data, err := encodeMessage(msg)
 	if err != nil {
 		n.reportErr(fmt.Errorf("gossip: encode message: %w", err))
+		return
+	}
+	if len(data) > maxUDPPayload {
+		if msg.Kind == msgDelta && len(msg.Records) > 1 {
+			mid := len(msg.Records) / 2
+			n.sendMessage(addr, Message{Kind: msgDelta, Records: msg.Records[:mid]})
+			n.sendMessage(addr, Message{Kind: msgDelta, Records: msg.Records[mid:]})
+			return
+		}
+		if msg.Kind == msgNeed && len(msg.Need) > 1 {
+			mid := len(msg.Need) / 2
+			n.sendMessage(addr, Message{Kind: msgNeed, Need: msg.Need[:mid]})
+			n.sendMessage(addr, Message{Kind: msgNeed, Need: msg.Need[mid:]})
+			return
+		}
+		n.reportErr(fmt.Errorf("gossip: message too large: %d bytes (limit %d)", len(data), maxUDPPayload))
 		return
 	}
 	peerAddr, err := net.ResolveUDPAddr("udp", addr)

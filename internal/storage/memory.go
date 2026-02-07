@@ -27,25 +27,29 @@ func NewMemoryStore[K ~string, V any](nodeID string, clock func() time.Time) Sto
 }
 
 func (s *memoryStore[K, V]) Set(ctx context.Context, key K, value V) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
+
+	s.mu.Lock()
 	record := Record[V]{
 		Value:     value,
 		Version:   atomic.AddUint64(&s.version, 1),
 		NodeID:    s.nodeID,
 		UpdatedAt: s.clock(),
 	}
-
-	s.mu.Lock()
 	s.values[key] = record
 	s.mu.Unlock()
 	return nil
 }
 
 func (s *memoryStore[K, V]) Get(ctx context.Context, key K) (Record[V], error) {
-	if err := ctx.Err(); err != nil {
-		return Record[V]{}, err
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return Record[V]{}, err
+		}
 	}
 	s.mu.RLock()
 	record, ok := s.values[key]
@@ -57,8 +61,10 @@ func (s *memoryStore[K, V]) Get(ctx context.Context, key K) (Record[V], error) {
 }
 
 func (s *memoryStore[K, V]) Merge(ctx context.Context, key K, record Record[V]) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 	}
 	s.mu.Lock()
 	current, ok := s.values[key]
@@ -72,8 +78,10 @@ func (s *memoryStore[K, V]) Merge(ctx context.Context, key K, record Record[V]) 
 }
 
 func (s *memoryStore[K, V]) Snapshot(ctx context.Context) (map[K]Record[V], error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 	}
 	s.mu.RLock()
 	out := make(map[K]Record[V], len(s.values))
@@ -85,8 +93,10 @@ func (s *memoryStore[K, V]) Snapshot(ctx context.Context) (map[K]Record[V], erro
 }
 
 func (s *memoryStore[K, V]) Len(ctx context.Context) (int, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 	}
 	s.mu.RLock()
 	size := len(s.values)
@@ -97,8 +107,10 @@ func (s *memoryStore[K, V]) Len(ctx context.Context) (int, error) {
 // Range holds a read lock for the duration of the iteration. Do not call
 // mutating methods from the callback to avoid deadlocks.
 func (s *memoryStore[K, V]) Range(ctx context.Context, fn func(key K, record Record[V]) bool) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	s.mu.RLock()
 	for key, record := range s.values {

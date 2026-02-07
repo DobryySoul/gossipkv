@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 
@@ -14,6 +15,7 @@ const serviceName = "_gossipkv._udp"
 
 // MDNS provides service discovery via mDNS in the local network.
 type MDNS struct {
+	nodeID  string
 	server  *zeroconf.Server
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
@@ -48,6 +50,7 @@ func NewMDNS(nodeID, bindAddr string, onPeer func([]string)) (*MDNS, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	entries := make(chan *zeroconf.ServiceEntry)
 	mdns := &MDNS{
+		nodeID:  nodeID,
 		server:  server,
 		cancel:  cancel,
 		entries: entries,
@@ -69,6 +72,9 @@ func NewMDNS(nodeID, bindAddr string, onPeer func([]string)) (*MDNS, error) {
 func (m *MDNS) browseLoop(entries <-chan *zeroconf.ServiceEntry, onPeer func([]string)) {
 	defer m.wg.Done()
 	for entry := range entries {
+		if m.isSelf(entry) {
+			continue
+		}
 		for _, ip := range entry.AddrIPv4 {
 			onPeer([]string{net.JoinHostPort(ip.String(), strconv.Itoa(entry.Port))})
 		}
@@ -76,6 +82,11 @@ func (m *MDNS) browseLoop(entries <-chan *zeroconf.ServiceEntry, onPeer func([]s
 			onPeer([]string{net.JoinHostPort(ip.String(), strconv.Itoa(entry.Port))})
 		}
 	}
+}
+
+// isSelf returns true if the discovered service entry belongs to this node.
+func (m *MDNS) isSelf(entry *zeroconf.ServiceEntry) bool {
+	return slices.Contains(entry.Text, "node="+m.nodeID)
 }
 
 // Stop shuts down the discovery service.

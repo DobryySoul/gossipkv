@@ -9,12 +9,14 @@ import (
 const (
 	msgDigest = "digest"
 	msgDelta  = "delta"
+	msgNeed   = "need"
 )
 
 type Message struct {
 	Kind    string
 	Digest  []DigestItem
 	Records []Record
+	Need    []string
 }
 
 type DigestItem struct {
