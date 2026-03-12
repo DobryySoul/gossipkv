@@ -134,25 +134,25 @@ func (n *Node[K, V]) readLoop() {
 			n.reportErr(fmt.Errorf("gossip: decode message: %w", err))
 			continue
 		}
-	if msg.Kind == msgNeed {
-		// Only accept need requests from known peers to prevent amplification reflection
-		n.peersMu.RLock()
-		_, knownPeer := n.peersSet[addr.String()]
-		n.peersMu.RUnlock()
-		if !knownPeer {
-			n.reportErr(fmt.Errorf("gossip: ignoring need request from unknown peer %s", addr.String()))
+		if msg.Kind == msgNeed {
+			// Only accept need requests from known peers to prevent amplification reflection
+			n.peersMu.RLock()
+			_, knownPeer := n.peersSet[addr.String()]
+			n.peersMu.RUnlock()
+			if !knownPeer {
+				n.reportErr(fmt.Errorf("gossip: ignoring need request from unknown peer %s", addr.String()))
+				return
+			}
+			n.handleNeed(addr, msg.Need)
 			return
 		}
-		n.handleNeed(addr, msg.Need)
-		return
-	}
 
-	switch msg.Kind {
-	case msgDigest:
-		n.handleDigest(addr, msg.Digest)
-	case msgDelta:
-		n.handleDelta(msg.Records)
-	}
+		switch msg.Kind {
+		case msgDigest:
+			n.handleDigest(addr, msg.Digest)
+		case msgDelta:
+			n.handleDelta(msg.Records)
+		}
 	}
 }
 
