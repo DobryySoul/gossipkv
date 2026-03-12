@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"context"
 	"testing"
 	"time"
 )
@@ -11,11 +10,11 @@ func TestMemoryStoreSetGet(t *testing.T) {
 	clock := func() time.Time { return now }
 	store := NewMemoryStore[string, string]("node-a", clock)
 
-	if err := store.Set(context.Background(), "k1", "v1"); err != nil {
+	if err := store.Set(t.Context(), "k1", "v1"); err != nil {
 		t.Fatalf("set failed: %v", err)
 	}
 
-	record, err := store.Get(context.Background(), "k1")
+	record, err := store.Get(t.Context(), "k1")
 	if err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
@@ -49,7 +48,7 @@ func TestMemoryStoreMerge(t *testing.T) {
 		UpdatedAt: time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC),
 	}
 
-	changed, err := store.Merge(context.Background(), "k1", older)
+	changed, err := store.Merge(t.Context(), "k1", older)
 	if err != nil {
 		t.Fatalf("merge failed: %v", err)
 	}
@@ -57,7 +56,7 @@ func TestMemoryStoreMerge(t *testing.T) {
 		t.Fatalf("expected change on first merge")
 	}
 
-	changed, err = store.Merge(context.Background(), "k1", newer)
+	changed, err = store.Merge(t.Context(), "k1", newer)
 	if err != nil {
 		t.Fatalf("merge failed: %v", err)
 	}
@@ -65,7 +64,7 @@ func TestMemoryStoreMerge(t *testing.T) {
 		t.Fatalf("expected change on newer merge")
 	}
 
-	record, err := store.Get(context.Background(), "k1")
+	record, err := store.Get(t.Context(), "k1")
 	if err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
@@ -76,14 +75,14 @@ func TestMemoryStoreMerge(t *testing.T) {
 
 func TestMemoryStoreSnapshot(t *testing.T) {
 	store := NewMemoryStore[string, string]("node-a", time.Now)
-	if err := store.Set(context.Background(), "k1", "v1"); err != nil {
+	if err := store.Set(t.Context(), "k1", "v1"); err != nil {
 		t.Fatalf("set failed: %v", err)
 	}
-	if err := store.Set(context.Background(), "k2", "v2"); err != nil {
+	if err := store.Set(t.Context(), "k2", "v2"); err != nil {
 		t.Fatalf("set failed: %v", err)
 	}
 
-	snapshot, err := store.Snapshot(context.Background())
+	snapshot, err := store.Snapshot(t.Context())
 	if err != nil {
 		t.Fatalf("snapshot failed: %v", err)
 	}
@@ -97,7 +96,7 @@ func TestMemoryStoreSnapshot(t *testing.T) {
 
 func TestMemoryStoreRangeAndLen(t *testing.T) {
 	store := NewMemoryStore[string, string]("node-a", time.Now)
-	ctx := context.Background()
+	ctx := t.Context()
 	_ = store.Set(ctx, "k1", "v1")
 	_ = store.Set(ctx, "k2", "v2")
 
@@ -154,36 +153,31 @@ func TestRecordNewerThanTieBreakers(t *testing.T) {
 
 func BenchmarkMemoryStoreSet(b *testing.B) {
 	store := NewMemoryStore[string, string]("node-a", time.Now)
-	ctx := context.Background()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = store.Set(ctx, "key", "value")
+	for b.Loop() {
+		_ = store.Set(b.Context(), "key", "value")
 	}
 }
 
 func BenchmarkMemoryStoreGet(b *testing.B) {
 	store := NewMemoryStore[string, string]("node-a", time.Now)
-	ctx := context.Background()
-	_ = store.Set(ctx, "key", "value")
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = store.Get(ctx, "key")
+	_ = store.Set(b.Context(), "key", "value")
+	for b.Loop() {
+		_, _ = store.Get(b.Context(), "key")
 	}
 }
 
 func BenchmarkMemoryStoreMerge(b *testing.B) {
 	store := NewMemoryStore[string, string]("node-a", time.Now)
-	ctx := context.Background()
 	record := Record[string]{
 		Value:     "value",
 		Version:   1,
 		NodeID:    "node-b",
 		UpdatedAt: time.Now(),
 	}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+
+	for b.Loop() {
 		record.Version++
 		record.UpdatedAt = record.UpdatedAt.Add(time.Nanosecond)
-		_, _ = store.Merge(ctx, "key", record)
+		_, _ = store.Merge(b.Context(), "key", record)
 	}
 }

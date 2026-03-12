@@ -1,7 +1,6 @@
 package gossip
 
 import (
-	"context"
 	"strconv"
 	"testing"
 	"time"
@@ -38,7 +37,7 @@ func BenchmarkGossipEncodeDecode(b *testing.B) {
 
 func BenchmarkGossipBuildDigest(b *testing.B) {
 	store := storage.NewMemoryStore[string, string]("node-a", time.Now)
-	ctx := context.Background()
+	ctx := b.Context()
 	for i := range 1000 {
 		_ = store.Set(ctx, "k"+strconv.Itoa(i), "value")
 	}
