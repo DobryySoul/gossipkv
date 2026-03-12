@@ -56,8 +56,9 @@ func NewMDNS(nodeID, bindAddr string, onPeer func([]string)) (*MDNS, error) {
 		entries: entries,
 	}
 
-	mdns.wg.Add(1)
-	go mdns.browseLoop(entries, onPeer)
+	mdns.wg.Go(func() {
+		mdns.browseLoop(entries, onPeer)
+	})
 
 	if err := resolver.Browse(ctx, serviceName, "local.", entries); err != nil {
 		cancel()
@@ -70,7 +71,6 @@ func NewMDNS(nodeID, bindAddr string, onPeer func([]string)) (*MDNS, error) {
 }
 
 func (m *MDNS) browseLoop(entries <-chan *zeroconf.ServiceEntry, onPeer func([]string)) {
-	defer m.wg.Done()
 	for entry := range entries {
 		if m.isSelf(entry) {
 			continue

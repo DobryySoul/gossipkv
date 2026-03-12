@@ -11,16 +11,27 @@ type Codec[V any] interface {
 	Unmarshal(data []byte) (V, error)
 }
 
-// BytesCodec passes through raw bytes without copying.
-// The caller must not modify the returned slice.
+// BytesCodec passes through raw bytes making a deep copy.
+// This guarantees that modifications to the returned slice
+// do not affect the internal storage.
 type BytesCodec struct{}
 
 func (BytesCodec) Marshal(value []byte) ([]byte, error) {
-	return value, nil
+	if value == nil {
+		return nil, nil
+	}
+	cp := make([]byte, len(value))
+	copy(cp, value)
+	return cp, nil
 }
 
 func (BytesCodec) Unmarshal(data []byte) ([]byte, error) {
-	return data, nil
+	if data == nil {
+		return nil, nil
+	}
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	return cp, nil
 }
 
 // StringCodec encodes strings as raw bytes.

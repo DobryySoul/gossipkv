@@ -115,9 +115,6 @@ func (db *DB[K, V]) Get(ctx context.Context, key K) (V, error) {
 // Further operations will return ErrClosed.
 // The provided context allows cancellation of the close operation.
 func (db *DB[K, V]) Close(ctx context.Context) error {
-	if err := mapContextErr(ctx); err != nil {
-		return err
-	}
 	db.mu.Lock()
 	if db.closed {
 		db.mu.Unlock()
@@ -125,13 +122,28 @@ func (db *DB[K, V]) Close(ctx context.Context) error {
 	}
 	db.closed = true
 	db.mu.Unlock()
-	if db.discovery != nil {
-		db.discovery.Stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		if db.discovery != nil {
+			db.discovery.Stop()
+		}
+		if db.gossip != nil {
+			_ = db.gossip.Stop()
+		}
+		errCh <- db.store.Close()
+	}()
+
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return mapContextErr(ctx)
+		case err := <-errCh:
+			return mapStoreErr(err)
+		}
+	} else {
+		return mapStoreErr(<-errCh)
 	}
-	if db.gossip != nil {
-		_ = db.gossip.Stop()
-	}
-	return mapStoreErr(db.store.Close())
 }
 
 func (db *DB[K, V]) check(ctx context.Context) error {

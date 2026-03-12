@@ -2,10 +2,9 @@ package gossip
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
-	"math/big"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"time"
@@ -16,6 +15,13 @@ import (
 // maxUDPPayload is a safe upper bound for a single UDP datagram.
 // Messages exceeding this size are automatically chunked.
 const maxUDPPayload = 65000
+
+// Limit digest size to prevent UDP packet overflow and reduce overhead.
+// 500 items easily fits in 64KB UDP packet.
+const maxDigestItems = 500
+
+// Defend against amplification by bounding the processed digest
+const maxProcessItems = 1000
 
 type Node[K ~string, V any] struct {
 	id        string
@@ -81,9 +87,12 @@ func (n *Node[K, V]) Start() error {
 	n.conn = conn
 	n.ctx, n.cancel = context.WithCancel(context.Background())
 
-	n.wg.Add(2)
-	go n.readLoop()
-	go n.gossipLoop()
+	n.wg.Go(func() {
+		n.readLoop()
+	})
+	n.wg.Go(func() {
+		n.gossipLoop()
+	})
 	return nil
 }
 
@@ -103,7 +112,6 @@ func (n *Node[K, V]) Stop() error {
 }
 
 func (n *Node[K, V]) readLoop() {
-	defer n.wg.Done()
 	buf := make([]byte, 64*1024)
 
 	for {
@@ -126,19 +134,29 @@ func (n *Node[K, V]) readLoop() {
 			n.reportErr(fmt.Errorf("gossip: decode message: %w", err))
 			continue
 		}
-		switch msg.Kind {
-		case msgDigest:
-			n.handleDigest(addr, msg.Digest)
-		case msgDelta:
-			n.handleDelta(msg.Records)
-		case msgNeed:
-			n.handleNeed(addr, msg.Need)
+	if msg.Kind == msgNeed {
+		// Only accept need requests from known peers to prevent amplification reflection
+		n.peersMu.RLock()
+		_, knownPeer := n.peersSet[addr.String()]
+		n.peersMu.RUnlock()
+		if !knownPeer {
+			n.reportErr(fmt.Errorf("gossip: ignoring need request from unknown peer %s", addr.String()))
+			return
 		}
+		n.handleNeed(addr, msg.Need)
+		return
+	}
+
+	switch msg.Kind {
+	case msgDigest:
+		n.handleDigest(addr, msg.Digest)
+	case msgDelta:
+		n.handleDelta(msg.Records)
+	}
 	}
 }
 
 func (n *Node[K, V]) gossipLoop() {
-	defer n.wg.Done()
 	ticker := time.NewTicker(n.interval)
 	defer ticker.Stop()
 
@@ -157,22 +175,23 @@ func (n *Node[K, V]) sendDigest() {
 	if !ok {
 		return
 	}
-	size, err := n.store.Len(n.ctx)
-	if err != nil {
-		return
-	}
-	digest := make([]DigestItem, 0, size)
-	if err := n.store.Range(n.ctx, func(key K, record storage.Record[V]) bool {
+
+	digest := make([]DigestItem, 0, maxDigestItems)
+
+	_ = n.store.Range(n.ctx, func(key K, record storage.Record[V]) bool {
 		digest = append(digest, DigestItem{
 			Key:       string(key),
 			Version:   record.Version,
 			NodeID:    record.NodeID,
 			UpdatedAt: record.UpdatedAt,
 		})
-		return true
-	}); err != nil {
+		return len(digest) < maxDigestItems
+	})
+
+	if len(digest) == 0 {
 		return
 	}
+
 	n.sendMessage(peer, Message{
 		Kind:   msgDigest,
 		Digest: digest,
@@ -180,76 +199,59 @@ func (n *Node[K, V]) sendDigest() {
 }
 
 // handleDigest implements push-pull anti-entropy.
-// Phase 1: send records that the remote node is missing or has stale versions of.
-// Phase 2: request records the remote has that we are missing or have stale versions of.
+// It checks the received digest and requests missing/stale records,
+// and proactively sends our newer records for the keys in the digest.
 func (n *Node[K, V]) handleDigest(addr *net.UDPAddr, digest []DigestItem) {
-	remote := make(map[string]storage.Record[V], len(digest))
-	for _, item := range digest {
-		remote[item.Key] = storage.Record[V]{
-			Version:   item.Version,
-			NodeID:    item.NodeID,
-			UpdatedAt: item.UpdatedAt,
-		}
+	if len(digest) > maxProcessItems {
+		digest = digest[:maxProcessItems]
 	}
 
-	size, err := n.store.Len(n.ctx)
-	if err != nil {
-		return
-	}
-
-	// Phase 1: collect records we have that the remote needs.
-	delta := make([]Record, 0, size)
-	localKeys := make(map[string]storage.Record[V], size)
-	if err := n.store.Range(n.ctx, func(key K, record storage.Record[V]) bool {
-		localKeys[string(key)] = record
-		other, ok := remote[string(key)]
-		if !ok || record.NewerThan(other) {
-			value, err := n.marshal(record.Value)
-			if err != nil {
-				n.reportErr(fmt.Errorf("gossip: marshal: %w", err))
-				return true
-			}
-			delta = append(delta, Record{
-				Key:       string(key),
-				Value:     value,
-				Version:   record.Version,
-				NodeID:    record.NodeID,
-				UpdatedAt: record.UpdatedAt,
-			})
-		}
-		return true
-	}); err != nil {
-		return
-	}
-
-	if len(delta) > 0 {
-		n.sendMessage(addr.String(), Message{
-			Kind:    msgDelta,
-			Records: delta,
-		})
-	}
-
-	// Phase 2: request records the remote has that we need.
 	var need []string
+	var delta []Record
+
 	for _, item := range digest {
-		local, ok := localKeys[item.Key]
-		if !ok {
-			need = append(need, item.Key)
+		local, err := n.store.Get(n.ctx, K(item.Key))
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				need = append(need, item.Key)
+			}
 			continue
 		}
+
 		remoteRecord := storage.Record[V]{
 			Version:   item.Version,
 			NodeID:    item.NodeID,
 			UpdatedAt: item.UpdatedAt,
 		}
+
 		if remoteRecord.NewerThan(local) {
 			need = append(need, item.Key)
+		} else if local.NewerThan(remoteRecord) {
+			value, err := n.marshal(local.Value)
+			if err != nil {
+				n.reportErr(fmt.Errorf("gossip: marshal: %w", err))
+				continue
+			}
+			delta = append(delta, Record{
+				Key:       item.Key,
+				Value:     value,
+				Version:   local.Version,
+				NodeID:    local.NodeID,
+				UpdatedAt: local.UpdatedAt,
+			})
 		}
 	}
+
 	if len(need) > 0 {
 		n.sendMessage(addr.String(), Message{
 			Kind: msgNeed,
 			Need: need,
+		})
+	}
+	if len(delta) > 0 {
+		n.sendMessage(addr.String(), Message{
+			Kind:    msgDelta,
+			Records: delta,
 		})
 	}
 }
@@ -273,6 +275,11 @@ func (n *Node[K, V]) handleDelta(records []Record) {
 
 // handleNeed responds with records that the remote node has requested.
 func (n *Node[K, V]) handleNeed(addr *net.UDPAddr, keys []string) {
+	const maxProcessItems = 1000
+	if len(keys) > maxProcessItems {
+		keys = keys[:maxProcessItems]
+	}
+
 	delta := make([]Record, 0, len(keys))
 	for _, key := range keys {
 		record, err := n.store.Get(n.ctx, K(key))
@@ -302,7 +309,7 @@ func (n *Node[K, V]) handleNeed(addr *net.UDPAddr, keys []string) {
 
 // sendMessage encodes and sends a message via UDP. Messages that exceed
 // maxUDPPayload are automatically split into smaller chunks for delta and
-// need messages. Oversized digest messages are reported as errors.
+// need messages. Single records exceeding limits are dropped to prevent stalling.
 func (n *Node[K, V]) sendMessage(addr string, msg Message) {
 	data, err := encodeMessage(msg)
 	if err != nil {
@@ -310,17 +317,31 @@ func (n *Node[K, V]) sendMessage(addr string, msg Message) {
 		return
 	}
 	if len(data) > maxUDPPayload {
-		if msg.Kind == msgDelta && len(msg.Records) > 1 {
-			mid := len(msg.Records) / 2
-			n.sendMessage(addr, Message{Kind: msgDelta, Records: msg.Records[:mid]})
-			n.sendMessage(addr, Message{Kind: msgDelta, Records: msg.Records[mid:]})
+		switch msg.Kind {
+		case msgDelta:
+			if len(msg.Records) > 1 {
+				mid := len(msg.Records) / 2
+				n.sendMessage(addr, Message{Kind: msgDelta, Records: msg.Records[:mid]})
+				n.sendMessage(addr, Message{Kind: msgDelta, Records: msg.Records[mid:]})
+				return
+			}
+			// One record alone exceeds max UDP size. Drop it to prevent poison pill.
+			n.reportErr(fmt.Errorf("gossip: single delta record too large: %d bytes (dropped)", len(data)))
 			return
-		}
-		if msg.Kind == msgNeed && len(msg.Need) > 1 {
-			mid := len(msg.Need) / 2
-			n.sendMessage(addr, Message{Kind: msgNeed, Need: msg.Need[:mid]})
-			n.sendMessage(addr, Message{Kind: msgNeed, Need: msg.Need[mid:]})
-			return
+		case msgNeed:
+			if len(msg.Need) > 1 {
+				mid := len(msg.Need) / 2
+				n.sendMessage(addr, Message{Kind: msgNeed, Need: msg.Need[:mid]})
+				n.sendMessage(addr, Message{Kind: msgNeed, Need: msg.Need[mid:]})
+				return
+			}
+		case msgDigest:
+			if len(msg.Digest) > 1 {
+				mid := len(msg.Digest) / 2
+				n.sendMessage(addr, Message{Kind: msgDigest, Digest: msg.Digest[:mid]})
+				n.sendMessage(addr, Message{Kind: msgDigest, Digest: msg.Digest[mid:]})
+				return
+			}
 		}
 		n.reportErr(fmt.Errorf("gossip: message too large: %d bytes (limit %d)", len(data), maxUDPPayload))
 		return
@@ -373,23 +394,8 @@ func (n *Node[K, V]) randomPeer() (string, bool) {
 	if len(n.peers) == 0 {
 		return "", false
 	}
-	index, err := cryptoIntn(len(n.peers))
-	if err != nil {
-		return "", false
-	}
+	index := rand.IntN(len(n.peers))
 	return n.peers[index], true
-}
-
-func cryptoIntn(n int) (int, error) {
-	if n <= 0 {
-		return 0, fmt.Errorf("gossip: invalid bound")
-	}
-	limit := big.NewInt(int64(n))
-	value, err := rand.Int(rand.Reader, limit)
-	if err != nil {
-		return 0, err
-	}
-	return int(value.Int64()), nil
 }
 
 func (n *Node[K, V]) reportErr(err error) {

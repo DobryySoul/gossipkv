@@ -114,6 +114,11 @@ func (s *memoryStore[K, V]) Range(ctx context.Context, fn func(key K, record Rec
 	}
 	s.mu.RLock()
 	for key, record := range s.values {
+		// Periodically check context inside the loop to avoid stalling on large datasets.
+		if ctx != nil && ctx.Err() != nil {
+			s.mu.RUnlock()
+			return ctx.Err()
+		}
 		if !fn(key, record) {
 			break
 		}
