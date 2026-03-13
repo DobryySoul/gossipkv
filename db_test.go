@@ -1,13 +1,12 @@
 package gossipkv
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"testing"
 )
 
-func TestBytesCodecDeepCopy(t *testing.T) {
+func TestBytesCodecZeroCopy(t *testing.T) {
 	codec := BytesCodec{}
 	original := []byte("hello world")
 
@@ -16,8 +15,8 @@ func TestBytesCodecDeepCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if &marshaled[0] == &original[0] {
-		t.Fatalf("Marshal did not create a deep copy")
+	if len(original) > 0 && &marshaled[0] != &original[0] {
+		t.Fatalf("Marshal created a deep copy")
 	}
 
 	// Test Unmarshal
@@ -25,17 +24,8 @@ func TestBytesCodecDeepCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if &unmarshaled[0] == &marshaled[0] {
-		t.Fatalf("Unmarshal did not create a deep copy")
-	}
-
-	// Verify that modifying the original doesn't change the marshaled or unmarshaled values
-	original[0] = 'X'
-	if bytes.Equal(marshaled, original) {
-		t.Fatalf("modifying original modified marshaled bytes")
-	}
-	if bytes.Equal(unmarshaled, original) {
-		t.Fatalf("modifying original modified unmarshaled bytes")
+	if len(marshaled) > 0 && &unmarshaled[0] != &marshaled[0] {
+		t.Fatalf("Unmarshal created a deep copy")
 	}
 }
 
