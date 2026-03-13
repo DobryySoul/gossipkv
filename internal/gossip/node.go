@@ -38,7 +38,7 @@ type Node[K ~string, V any] struct {
 	wg       sync.WaitGroup
 
 	peersMu  sync.RWMutex
-	peers    []string
+	peers    []*net.UDPAddr
 	peersSet map[string]struct{}
 
 	ctx    context.Context
@@ -57,8 +57,12 @@ func NewNode[K ~string, V any](
 ) *Node[K, V] {
 	filtered := filterPeers(bindAddr, peers)
 	peersSet := make(map[string]struct{}, len(filtered))
+	var udpPeers []*net.UDPAddr
 	for _, peer := range filtered {
-		peersSet[peer] = struct{}{}
+		if addr, err := net.ResolveUDPAddr("udp", peer); err == nil {
+			peersSet[peer] = struct{}{}
+			udpPeers = append(udpPeers, addr)
+		}
 	}
 	return &Node[K, V]{
 		id:        nodeID,
@@ -69,7 +73,7 @@ func NewNode[K ~string, V any](
 		unmarshal: unmarshal,
 		onError:   onError,
 		stop:      make(chan struct{}),
-		peers:     filtered,
+		peers:     udpPeers,
 		peersSet:  peersSet,
 		ctx:       context.Background(),
 	}
@@ -125,6 +129,8 @@ func (n *Node[K, V]) readLoop() {
 			case <-n.stop:
 				return
 			default:
+				n.reportErr(fmt.Errorf("gossip: read udp err: %w", err))
+				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 		}
@@ -134,20 +140,19 @@ func (n *Node[K, V]) readLoop() {
 			n.reportErr(fmt.Errorf("gossip: decode message: %w", err))
 			continue
 		}
-		if msg.Kind == msgNeed {
-			// Only accept need requests from known peers to prevent amplification reflection
-			n.peersMu.RLock()
-			_, knownPeer := n.peersSet[addr.String()]
-			n.peersMu.RUnlock()
-			if !knownPeer {
-				n.reportErr(fmt.Errorf("gossip: ignoring need request from unknown peer %s", addr.String()))
-				return
-			}
-			n.handleNeed(addr, msg.Need)
-			return
+
+		// Only accept messages from known peers to prevent amplification reflection
+		n.peersMu.RLock()
+		_, knownPeer := n.peersSet[addr.String()]
+		n.peersMu.RUnlock()
+		if !knownPeer {
+			n.reportErr(fmt.Errorf("gossip: ignoring message from unknown peer %s", addr.String()))
+			continue
 		}
 
 		switch msg.Kind {
+		case msgNeed:
+			n.handleNeed(addr, msg.Need)
 		case msgDigest:
 			n.handleDigest(addr, msg.Digest)
 		case msgDelta:
@@ -243,13 +248,13 @@ func (n *Node[K, V]) handleDigest(addr *net.UDPAddr, digest []DigestItem) {
 	}
 
 	if len(need) > 0 {
-		n.sendMessage(addr.String(), Message{
+		n.sendMessage(addr, Message{
 			Kind: msgNeed,
 			Need: need,
 		})
 	}
 	if len(delta) > 0 {
-		n.sendMessage(addr.String(), Message{
+		n.sendMessage(addr, Message{
 			Kind:    msgDelta,
 			Records: delta,
 		})
@@ -257,7 +262,13 @@ func (n *Node[K, V]) handleDigest(addr *net.UDPAddr, digest []DigestItem) {
 }
 
 func (n *Node[K, V]) handleDelta(records []Record) {
+	now := time.Now()
 	for _, item := range records {
+		if item.UpdatedAt.After(now.Add(5 * time.Minute)) {
+			n.reportErr(fmt.Errorf("gossip: reject record %s from future", item.Key))
+			continue
+		}
+
 		value, err := n.unmarshal(item.Value)
 		if err != nil {
 			n.reportErr(fmt.Errorf("gossip: unmarshal: %w", err))
@@ -300,7 +311,7 @@ func (n *Node[K, V]) handleNeed(addr *net.UDPAddr, keys []string) {
 		})
 	}
 	if len(delta) > 0 {
-		n.sendMessage(addr.String(), Message{
+		n.sendMessage(addr, Message{
 			Kind:    msgDelta,
 			Records: delta,
 		})
@@ -310,49 +321,53 @@ func (n *Node[K, V]) handleNeed(addr *net.UDPAddr, keys []string) {
 // sendMessage encodes and sends a message via UDP. Messages that exceed
 // maxUDPPayload are automatically split into smaller chunks for delta and
 // need messages. Single records exceeding limits are dropped to prevent stalling.
-func (n *Node[K, V]) sendMessage(addr string, msg Message) {
-	data, err := encodeMessage(msg)
-	if err != nil {
-		n.reportErr(fmt.Errorf("gossip: encode message: %w", err))
-		return
-	}
-	if len(data) > maxUDPPayload {
-		switch msg.Kind {
-		case msgDelta:
-			if len(msg.Records) > 1 {
-				mid := len(msg.Records) / 2
-				n.sendMessage(addr, Message{Kind: msgDelta, Records: msg.Records[:mid]})
-				n.sendMessage(addr, Message{Kind: msgDelta, Records: msg.Records[mid:]})
-				return
-			}
-			// One record alone exceeds max UDP size. Drop it to prevent poison pill.
-			n.reportErr(fmt.Errorf("gossip: single delta record too large: %d bytes (dropped)", len(data)))
-			return
-		case msgNeed:
-			if len(msg.Need) > 1 {
-				mid := len(msg.Need) / 2
-				n.sendMessage(addr, Message{Kind: msgNeed, Need: msg.Need[:mid]})
-				n.sendMessage(addr, Message{Kind: msgNeed, Need: msg.Need[mid:]})
-				return
-			}
-		case msgDigest:
-			if len(msg.Digest) > 1 {
-				mid := len(msg.Digest) / 2
-				n.sendMessage(addr, Message{Kind: msgDigest, Digest: msg.Digest[:mid]})
-				n.sendMessage(addr, Message{Kind: msgDigest, Digest: msg.Digest[mid:]})
-				return
-			}
+func (n *Node[K, V]) sendMessage(peerAddr *net.UDPAddr, initialMsg Message) {
+	queue := []Message{initialMsg}
+
+	for len(queue) > 0 {
+		msg := queue[0]
+		queue = queue[1:]
+
+		data, err := encodeMessage(msg)
+		if err != nil {
+			n.reportErr(fmt.Errorf("gossip: encode message: %w", err))
+			continue
 		}
-		n.reportErr(fmt.Errorf("gossip: message too large: %d bytes (limit %d)", len(data), maxUDPPayload))
-		return
-	}
-	peerAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		n.reportErr(fmt.Errorf("gossip: resolve addr: %w", err))
-		return
-	}
-	if _, err := n.conn.WriteToUDP(data, peerAddr); err != nil {
-		n.reportErr(fmt.Errorf("gossip: send: %w", err))
+
+		if len(data) > maxUDPPayload {
+			switch msg.Kind {
+			case msgDelta:
+				if len(msg.Records) > 1 {
+					mid := len(msg.Records) / 2
+					queue = append(queue, Message{Kind: msgDelta, Records: msg.Records[:mid]})
+					queue = append(queue, Message{Kind: msgDelta, Records: msg.Records[mid:]})
+					continue
+				}
+				// One record alone exceeds max UDP size. Drop it to prevent poison pill.
+				n.reportErr(fmt.Errorf("gossip: single delta record too large: %d bytes (dropped)", len(data)))
+				continue
+			case msgNeed:
+				if len(msg.Need) > 1 {
+					mid := len(msg.Need) / 2
+					queue = append(queue, Message{Kind: msgNeed, Need: msg.Need[:mid]})
+					queue = append(queue, Message{Kind: msgNeed, Need: msg.Need[mid:]})
+					continue
+				}
+			case msgDigest:
+				if len(msg.Digest) > 1 {
+					mid := len(msg.Digest) / 2
+					queue = append(queue, Message{Kind: msgDigest, Digest: msg.Digest[:mid]})
+					queue = append(queue, Message{Kind: msgDigest, Digest: msg.Digest[mid:]})
+					continue
+				}
+			}
+			n.reportErr(fmt.Errorf("gossip: message too large: %d bytes (limit %d)", len(data), maxUDPPayload))
+			continue
+		}
+
+		if _, err := n.conn.WriteToUDP(data, peerAddr); err != nil {
+			n.reportErr(fmt.Errorf("gossip: send: %w", err))
+		}
 	}
 }
 
@@ -382,17 +397,19 @@ func (n *Node[K, V]) AddPeers(peers []string) {
 		if _, ok := n.peersSet[peer]; ok {
 			continue
 		}
-		n.peersSet[peer] = struct{}{}
-		n.peers = append(n.peers, peer)
+		if addr, err := net.ResolveUDPAddr("udp", peer); err == nil {
+			n.peersSet[peer] = struct{}{}
+			n.peers = append(n.peers, addr)
+		}
 	}
 	n.peersMu.Unlock()
 }
 
-func (n *Node[K, V]) randomPeer() (string, bool) {
+func (n *Node[K, V]) randomPeer() (*net.UDPAddr, bool) {
 	n.peersMu.RLock()
 	defer n.peersMu.RUnlock()
 	if len(n.peers) == 0 {
-		return "", false
+		return nil, false
 	}
 	index := rand.IntN(len(n.peers))
 	return n.peers[index], true

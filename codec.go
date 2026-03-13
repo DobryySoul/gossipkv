@@ -17,21 +17,11 @@ type Codec[V any] interface {
 type BytesCodec struct{}
 
 func (BytesCodec) Marshal(value []byte) ([]byte, error) {
-	if value == nil {
-		return nil, nil
-	}
-	cp := make([]byte, len(value))
-	copy(cp, value)
-	return cp, nil
+	return value, nil
 }
 
 func (BytesCodec) Unmarshal(data []byte) ([]byte, error) {
-	if data == nil {
-		return nil, nil
-	}
-	cp := make([]byte, len(data))
-	copy(cp, data)
-	return cp, nil
+	return data, nil
 }
 
 // StringCodec encodes strings as raw bytes.
