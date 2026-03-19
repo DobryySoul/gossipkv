@@ -14,7 +14,7 @@ import (
 // DB represents a running gossipkv node.
 // It is safe for concurrent use by multiple goroutines.
 // K must be a string or a type with underlying string.
-type DB[K ~string, V any] struct {
+type Node[K ~string, V any] struct {
 	cfg       Config
 	store     storage.Store[K, V]
 	gossip    *gossip.Node[K, V]
@@ -26,7 +26,7 @@ type DB[K ~string, V any] struct {
 // New creates a new gossipkv node with the provided options.
 // The returned instance uses an in-memory store in the current version.
 // K must be provided explicitly because it cannot be inferred from arguments.
-func New[K ~string, V any](opts ...Option) (*DB[K, V], error) {
+func New[K ~string, V any](opts ...Option) (*Node[K, V], error) {
 	cfg := defaultConfig()
 	for _, opt := range opts {
 		if opt == nil {
@@ -56,7 +56,7 @@ func New[K ~string, V any](opts ...Option) (*DB[K, V], error) {
 		errorHandler = func(error) {}
 	}
 
-	db := &DB[K, V]{
+	n := &Node[K, V]{
 		cfg:   cfg,
 		store: storage.NewMemoryStore[K, V](cfg.NodeID, nil),
 	}
@@ -66,7 +66,7 @@ func New[K ~string, V any](opts ...Option) (*DB[K, V], error) {
 			cfg.BindAddr,
 			cfg.Seeds,
 			cfg.GossipInterval,
-			db.store,
+			n.store,
 			codec.Marshal,
 			codec.Unmarshal,
 			errorHandler,
@@ -74,37 +74,37 @@ func New[K ~string, V any](opts ...Option) (*DB[K, V], error) {
 		if err := node.Start(); err != nil {
 			return nil, err
 		}
-		db.gossip = node
+		n.gossip = node
 		if cfg.Discovery {
-			mdns, err := discovery.NewMDNS(cfg.NodeID, cfg.BindAddr, db.gossip.AddPeers)
+			mdns, err := discovery.NewMDNS(cfg.NodeID, cfg.BindAddr, n.gossip.AddPeers)
 			if err != nil {
-				_ = db.gossip.Stop()
+				_ = n.gossip.Stop()
 				return nil, err
 			}
-			db.discovery = mdns
+			n.discovery = mdns
 		}
 	}
-	return db, nil
+	return n, nil
 }
 
 // Set stores a value under the given key.
 // The call is context-aware and returns ErrCanceled/ErrTimeout accordingly.
-func (db *DB[K, V]) Set(ctx context.Context, key K, value V) error {
-	if err := db.check(ctx); err != nil {
+func (n *Node[K, V]) Set(ctx context.Context, key K, value V) error {
+	if err := n.check(ctx); err != nil {
 		return err
 	}
-	return mapStoreErr(db.store.Set(ctx, key, value))
+	return mapStoreErr(n.store.Set(ctx, key, value))
 }
 
 // Get returns a value for the given key.
 // It returns ErrNotFound if the key does not exist.
-func (db *DB[K, V]) Get(ctx context.Context, key K) (V, error) {
+func (n *Node[K, V]) Get(ctx context.Context, key K) (V, error) {
 	var zero V
 
-	if err := db.check(ctx); err != nil {
+	if err := n.check(ctx); err != nil {
 		return zero, err
 	}
-	record, err := db.store.Get(ctx, key)
+	record, err := n.store.Get(ctx, key)
 	if err != nil {
 		return zero, mapStoreErr(err)
 	}
@@ -114,24 +114,24 @@ func (db *DB[K, V]) Get(ctx context.Context, key K) (V, error) {
 // Close releases resources and marks the DB as closed.
 // Further operations will return ErrClosed.
 // The provided context allows cancellation of the close operation.
-func (db *DB[K, V]) Close(ctx context.Context) error {
-	db.mu.Lock()
-	if db.closed {
-		db.mu.Unlock()
+func (n *Node[K, V]) Close(ctx context.Context) error {
+	n.mu.Lock()
+	if n.closed {
+		n.mu.Unlock()
 		return ErrClosed
 	}
-	db.closed = true
-	db.mu.Unlock()
+	n.closed = true
+	n.mu.Unlock()
 
 	errCh := make(chan error, 1)
 	go func() {
-		if db.discovery != nil {
-			db.discovery.Stop()
+		if n.discovery != nil {
+			n.discovery.Stop()
 		}
-		if db.gossip != nil {
-			_ = db.gossip.Stop()
+		if n.gossip != nil {
+			_ = n.gossip.Stop()
 		}
-		errCh <- db.store.Close()
+		errCh <- n.store.Close()
 	}()
 
 	if ctx != nil {
@@ -146,13 +146,13 @@ func (db *DB[K, V]) Close(ctx context.Context) error {
 	}
 }
 
-func (db *DB[K, V]) check(ctx context.Context) error {
+func (n *Node[K, V]) check(ctx context.Context) error {
 	if err := mapContextErr(ctx); err != nil {
 		return err
 	}
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if db.closed {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.closed {
 		return ErrClosed
 	}
 	return nil
