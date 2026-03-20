@@ -1,6 +1,6 @@
 module github.com/DobryySoul/gossipkv
 
-go 1.25.6
+go 1.26.1
 
 require github.com/grandcat/zeroconf v1.0.0
 
